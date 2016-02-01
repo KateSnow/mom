@@ -67,6 +67,25 @@ module ocean_rivermix_mod
 !  solid runoff. Default calving_insertion_thickness=0.0 (all in top).
 !  </DATA>
 !
+!  <DATA NAME="mix_south_of" TYPE="real" UNITS="degrees N">
+!  Latitude south of which a different mixing depth may be applied
+!  through runoff_insertion_thickness_S (e.g. to simulate basal melting
+!  around antarctica). NOTE: Scheme only applied to liquid runoff and if 
+!  discharge_combine_runoff_calve=.false.
+!  NOTE: currently only available for insertion_thickness not
+!  diffusion_thickness...
+!  Default mix_south_of=-90.0
+!  </DATA>    KS
+!  <DATA NAME="runoff_insertion_thickness_S" TYPE="real" UNITS="meter">
+!  Thickness of the column south of mix_south_of over which to insert
+!  tracers carried by liquid runoff. 
+!  Default runoff_insertion_thickness_S=0.0 (all in top).
+!  </DATA>    KS
+!  <DATA NAME="specify_runoff_south_temp_zero" TYPE="logical">
+!  For specifying the southern runoff temp to zero
+!  Default specify_runoff_south_temp=.false.
+!  </DATA>    KS
+!
 !  <DATA NAME="river_diffusion_thickness" TYPE="real" UNITS="meter">
 !  Thickness of the column over which to diffuse tracers from 
 !  rivers. 
@@ -145,6 +164,10 @@ real    :: runoff_insertion_thickness=0.0  ! static thickness (m) of ocean colum
                                            ! actual thickness is based on model grid spacing. min thickness=dtz(1).
 real    :: calving_insertion_thickness=0.0 ! static thickness (m) of ocean column where discharge solid runoff.
                                            ! actual thickness is based on model grid spacing. min thickness=dtz(1).
+
+real    :: mix_south_of=-90.0              !latitude south of which runoff_insertion_thickness_S is applied KS
+real    :: runoff_insertion_thickness_S=0.0  ! static thickness (m) of ocean applied south of mix_south_of   KS
+logical :: specify_runoff_south_temp_zero=.false. !to specify constant temp for southern runoff KS
 
 real    :: river_diffusion_thickness=0.0 ! static thickness (m) of ocean column where diffuse tracer at river mouths.    
                                          ! actual thickness is based on model grid spacing. min thickness=dtz(1).      
@@ -336,6 +359,10 @@ integer :: id_wdian_salt_pbl_cl_pr_on_nrho =-1
 integer :: id_tform_salt_pbl_cl_pr         =-1
 integer :: id_tform_salt_pbl_cl_pr_on_nrho =-1
 
+!KS-------------------------------------------
+integer :: id_tfreeze                      =-1
+integer :: id_ttracer_flux                 =-1
+!KS-------------------------------------------
 
 integer :: unit=6       ! processor zero writes to unit 6
 
@@ -359,13 +386,15 @@ logical :: debug_this_module_heat=.false.
 logical :: module_is_initialized = .FALSE.
 logical :: use_this_module       = .true.
 
+! KS last 3 inputs
 namelist /ocean_rivermix_nml/ use_this_module, debug_this_module,   &
          debug_all_in_top_cell, debug_this_module_heat,             &
          river_diffuse_temp, river_diffuse_salt,                    & 
          river_diffusion_thickness, river_diffusivity,              &
          discharge_combine_runoff_calve, river_insertion_thickness, &
          runoff_insertion_thickness, calving_insertion_thickness,   &
-         do_bitwise_exact_sum
+         do_bitwise_exact_sum, mix_south_of,                        & 
+         runoff_insertion_thickness_S, specify_runoff_south_temp_zero
 
 contains
 
@@ -592,6 +621,19 @@ contains
                          'diff_cbt(salt) enhancement at rivers', 'm^2/s',        &
                          missing_value=missing_value,range=(/-10.0,1e6/))
 
+   !KS-------------------------------------------------------------------------
+   id_tfreeze = -1
+   id_tfreeze = register_diag_field ('ocean_model', 'tfreeze',&
+                         Grid%tracer_axes(1:3), Time%model_time,&
+                         'tfreeze', 'degC',&
+                         missing_value=missing_value,range=(/-10.0,1e6/))
+   id_ttracer_flux = -1
+   id_ttracer_flux = register_diag_field ('ocean_model', 'ttracer_flux',&
+                         Grid%tracer_axes(1:3), Time%model_time,&
+                         'ttracer_flux', 'W/m^2',&
+                         missing_value=missing_value,range=(/-10.0,1e6/))
+   !KS------------------------------------------------------------------------
+
    call watermass_diag_init(Time, Dens)
 
 
@@ -686,7 +728,8 @@ subroutine rivermix (Time, Thickness, Dens, T_prog, river, runoff, calving, &
          enddo
       enddo
       if(runoff_discharge) then
-          call runoff_calving_discharge_tracer(Time, Thickness, &
+          !KS added Dens
+          call runoff_calving_discharge_tracer(Time, Thickness, Dens, &
           T_prog(1:num_prog_tracers), runoff, runoff_insertion_thickness, 1)
       endif 
       do n=1,num_prog_tracers 
@@ -708,7 +751,8 @@ subroutine rivermix (Time, Thickness, Dens, T_prog, river, runoff, calving, &
          enddo
       enddo
       if(calving_discharge) then
-          call runoff_calving_discharge_tracer(Time, Thickness, &
+          ! KS added Dens
+          call runoff_calving_discharge_tracer(Time, Thickness, Dens, &
           T_prog(1:num_prog_tracers), calving, calving_insertion_thickness, 2)
       endif 
       do n=1,num_prog_tracers 
@@ -932,12 +976,15 @@ end subroutine river_discharge_tracer
 !
 ! </DESCRIPTION>
 !
-subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
-           river, insertion_thickness, runoff_type)
+subroutine runoff_calving_discharge_tracer (Time, Thickness, Dens, T_prog, &
+           river, insertion_thickness, runoff_type) 
+ !KS last two inputs and Dens
 
   type(ocean_time_type),          intent(in)    :: Time
   type(ocean_thickness_type),     intent(in)    :: Thickness
   type(ocean_prog_tracer_type),   intent(inout) :: T_prog(:)
+  !KS added density line below...
+  type(ocean_density_type),       intent(in)    :: Dens
   real, dimension(isd:,jsd:),     intent(in)    :: river
   real,                           intent(in)    :: insertion_thickness
   integer,                        intent(in)    :: runoff_type
@@ -949,6 +996,16 @@ subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
   real    :: zextra, zinsert, tracerextra, tracernew(nk)
   real    :: tracer_input 
   
+  ! KS added below coefficients in freezing temperature with preTEOS10
+  real :: a0, a1, a2, a3, a4, a5, a6
+  real :: b0, b1, b2, b3
+  real :: c1, c2
+  real :: s, sqrts, press
+  real :: tf_num, tf_den
+  !real :: tfreeze
+  real, dimension(isd:ied,jsd:jed,nk)      :: tfreeze
+  real, dimension(isd:ied,jsd:jed,nk)      :: tracer_flux_t
+
   integer :: stdoutunit 
   stdoutunit=stdout() 
 
@@ -970,6 +1027,22 @@ subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
   delta_rho0_triver = 0.0
   wrk1              = 0.0
   tracer_flux       = 0.0
+
+  ! KS I need some coefficient for calculting freezing temp
+  ! (stolen from ocean_frazil.F90)
+  a0 =  2.5180516744541290e-03
+  a1 = -5.8545863698926184e-02
+  a2 =  2.2979985780124325e-03
+  a3 = -3.0086338218235500e-04
+  a4 = -7.0023530029351803e-04
+  a5 =  8.4149607219833806e-09
+  a6 =  1.1845857563107403e-11
+
+  b0 =  1.0000000000000000e+00
+  b1 = -3.8493266309172074e-05
+  b2 =  9.1686537446749641e-10
+  b3 =  1.3632481944285909e-06
+  ! KS done stealing-------------------------------------------
                
   do j=jsc,jec
      do i=isc,iec
@@ -984,6 +1057,16 @@ subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
             depth = min(Grd%ht(i,j),insertion_thickness)              ! be sure not to discharge river content into rock 
             nz    = min(Grd%kmt(i,j),floor(frac_index(depth,Grd%zw))) ! number of k-levels into which discharge rivers
             nz    = max(1,nz)                                         ! make sure have at least one cell to discharge into
+
+            ! KS changes from here...
+            if(runoff_type==1) then   !only apply latitude dependence to liquid runoff
+               if(mix_south_of>Grd%yt(i,j)) then
+                   depth = min(Grd%ht(i,j),runoff_insertion_thickness_S) 
+                   nz    = min(Grd%kmt(i,j),floor(frac_index(depth,Grd%zw))) 
+                   nz    = max(1,nz)
+               endif
+            endif
+
 
             ! determine fractional thicknesses of grid cells 
             thkocean = 0.0
@@ -1027,11 +1110,20 @@ subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
 !  !        !
 !  xxxxxxxxxx               
 
-               if(runoff_type==1) then 
-                  tracer_flux(i,j) = T_prog(n)%runoff_tracer_flux(i,j)
-               else 
-                  tracer_flux(i,j) = T_prog(n)%calving_tracer_flux(i,j)
-               endif
+
+               ! KS specify runoff tracer flux for southern waters, only
+               ! changing the temp tracer flux (salt flux remains 0)
+               ! The runoff_tracer_flux is simply the river runoff flux
+               ! (runoff(i,j) * trunoff) where trunoff is temp of runoff. Since
+               ! we need it to be depth dependent, I'm going to now put it in
+               ! the do k=nz,1,-1 loop below (NOTE: I havn't updated the output
+               ! diagnostics...):
+               ! Previously code simply said:
+               !if(runoff_type==1) then
+               !   tracer_flux(i,j) = T_prog(n)%runoff_tracer_flux(i,j)
+               !else
+               !   tracer_flux(i,j) = T_prog(n)%calving_tracer_flux(i,j)
+               !endif
 
                zextra=0.0
                do k=nz,1,-1
@@ -1042,6 +1134,51 @@ subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
                   else
                       tracerextra = tracernew(k+1)
                   endif
+
+                  ! KS adding tracer_flux dependent on freezing temp----
+                  if(runoff_type==1) then
+                      if(specify_runoff_south_temp_zero.and.(n==index_temp)) then
+                          if(mix_south_of>Grd%yt(i,j)) then
+                              !tracer_flux(i,j) = 0.0
+                              ! NOTE: I've stolen all of below from
+                              ! ocean_frazil.F90:
+                              ! NOTE2: this is PRETEOS-10 NOT TEOS-10 as thats
+                              ! what I had turned on in my model. Will need to
+                              ! update this if we want it to be used by other
+                              ! people...
+                              ! NOTE3: I've assumed the ice/water is NOT air
+                              ! saturated in getting c1 and c2... not sure how
+                              ! right 
+                              ! that is, particularly since ocean_frazil.F90
+                              ! seems 
+                              ! to assume the water is air saturated...
+                              c1 = 0.0
+                              c2 = 0.0
+                              ! s       = T_prog(index_salt)%field(i,j,k,tau)
+                              s       = 0 !freeze temp fresh water
+                              press   = Dens%pressure_at_depth(i,j,k)
+                              sqrts   = sqrt(s)
+                              tf_num  = a0 + s*(a1 + sqrts*(a2 + sqrts*a3)) + press*(a4 + press*(a5 + s*a6))
+                              tf_den  = b0 + press*(b1 + press*b2) + s*s*sqrts*b3
+                              tfreeze(i,j,k) = tf_num/tf_den + (c1 + s*c2)
+                              ! NOTE4 add 0.0001 because I want the water to be
+                              ! slightly warmer than the freezing temp so that
+                              ! it doesn't just instantly form into frazil
+                              ! ice...
+                              tracer_flux_t(i,j,k) = river(i,j)*(tfreeze(i,j,k)+ 0.0001)
+                              tracer_flux(i,j) = tracer_flux_t(i,j,k)
+                          else
+                              tracer_flux(i,j) =T_prog(n)%runoff_tracer_flux(i,j)
+                          endif
+                      else
+                          tracer_flux(i,j) = T_prog(n)%runoff_tracer_flux(i,j)
+                      endif
+                  else
+                      tracer_flux(i,j) = T_prog(n)%calving_tracer_flux(i,j)
+                  endif
+                  ! KS end changes added ---------------------------------------
+
+
 
                   zinsert = river(i,j)*dtime*delta(k)
                   tracernew(k) = (tracerextra*zextra + T_prog(n)%field(i,j,k,tau)*Thickness%rho_dzt(i,j,k,tau) + &
@@ -1118,6 +1255,15 @@ subroutine runoff_calving_discharge_tracer (Time, Thickness, T_prog, &
       endif
 
   endif
+
+  ! KS adding diagnostics for output
+  if (id_tfreeze > 0) then
+     call diagnose_3d(Time, Grd, id_tfreeze, tfreeze)
+  endif
+  if (id_ttracer_flux > 0) then
+     call diagnose_3d(Time, Grd, id_ttracer_flux, tracer_flux_t)
+  endif
+  ! KS end changes--------------------------
 
 end subroutine runoff_calving_discharge_tracer
 ! </SUBROUTINE> NAME="runoff_calving_discharge_tracer"
