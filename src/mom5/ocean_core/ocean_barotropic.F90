@@ -2761,7 +2761,7 @@ end subroutine eta_and_pbot_tendency
 ! </DESCRIPTION>
 !
 subroutine update_ocean_barotropic (Time, Dens, Thickness, Adv_vel, &
-                                    Ext_mode, patm, pme, river, use_blobs)
+                                    Ext_mode, patm, pme, river,use_blobs)
 
   type(ocean_time_type),          intent(in)    :: Time
   type(ocean_density_type),       intent(in)    :: Dens
@@ -2831,15 +2831,15 @@ subroutine update_ocean_barotropic (Time, Dens, Thickness, Adv_vel, &
       
       if(horz_grid == MOM_BGRID) then 
          if(vert_coordinate_class==DEPTH_BASED) then 
-           call pred_corr_tropic_depth_bgrid (Time, Thickness, Ext_mode, patm, pme, river, use_blobs)
+           call pred_corr_tropic_depth_bgrid (Time, Thickness, Ext_mode, patm, pme, river,use_blobs)
          elseif(vert_coordinate_class==PRESSURE_BASED ) then 
-           call pred_corr_tropic_press_bgrid (Time, Thickness, Ext_mode, pme, river, use_blobs)
+           call pred_corr_tropic_press_bgrid (Time, Thickness, Ext_mode, pme, river,use_blobs)
          endif  
       else 
          if(vert_coordinate_class==DEPTH_BASED) then 
-           call pred_corr_tropic_depth_cgrid (Time, Thickness, Ext_mode, patm, pme, river, use_blobs)
+           call pred_corr_tropic_depth_cgrid (Time, Thickness, Ext_mode, patm, pme, river,use_blobs)
          elseif(vert_coordinate_class==PRESSURE_BASED ) then 
-           call pred_corr_tropic_press_cgrid (Time, Thickness, Ext_mode, pme, river, use_blobs)
+           call pred_corr_tropic_press_cgrid (Time, Thickness, Ext_mode, pme, river,use_blobs)
          endif  
       endif 
 
@@ -3181,7 +3181,7 @@ subroutine ocean_mass_forcing(Time, Thickness, Ext_mode)
         enddo
      enddo
   enddo
- 
+
   ! time tendency for atmospheric pressure (Pa/sec)  
   ! values needed in halos in order for Thickness%rho_dzt_tendency
   ! to be defined well on halos. 
@@ -3222,7 +3222,7 @@ end subroutine ocean_mass_forcing
 !
 ! </DESCRIPTION>
 !
-subroutine pred_corr_tropic_depth_bgrid (Time, Thickness, Ext_mode, patm, pme, river, use_blobs)
+subroutine pred_corr_tropic_depth_bgrid (Time, Thickness, Ext_mode, patm, pme, river,use_blobs)
 
   type(ocean_time_type),          intent(in)    :: Time 
   type(ocean_thickness_type),     intent(in)    :: Thickness 
@@ -3311,8 +3311,8 @@ subroutine pred_corr_tropic_depth_bgrid (Time, Thickness, Ext_mode, patm, pme, r
         ! smoothing eta_t, not for smoothing eta_t_bt.
         steady_forcing(i,j) = Grd%tmask(i,j,1)*( pme(i,j) + river(i,j) + Ext_mode%source(i,j) - Ext_mode%eta_smooth(i,j))
         if (use_blobs) then
-           steady_forcing(i,j) = steady_forcing(i,j) + Grd%tmask(i,j,1)*Ext_mode%conv_blob(i,j)
-        endif
+            steady_forcing(i,j) = steady_forcing(i,j) + Grd%tmask(i,j,1)*(Ext_mode%conv_blob(i,j))
+        endif 
      enddo
   enddo
 
@@ -3598,7 +3598,7 @@ end subroutine pred_corr_tropic_depth_bgrid
 !
 ! </DESCRIPTION>
 !
-subroutine pred_corr_tropic_depth_cgrid (Time, Thickness, Ext_mode, patm, pme, river, use_blobs)
+subroutine pred_corr_tropic_depth_cgrid (Time, Thickness, Ext_mode, patm, pme, river,use_blobs)
 
   type(ocean_time_type),          intent(in)    :: Time 
   type(ocean_thickness_type),     intent(in)    :: Thickness 
@@ -3701,7 +3701,7 @@ subroutine pred_corr_tropic_depth_cgrid (Time, Thickness, Ext_mode, patm, pme, r
         ! smoothing eta_t, not for smoothing eta_t_bt.
         steady_forcing(i,j) = Grd%tmask(i,j,1)*( pme(i,j) + river(i,j) + Ext_mode%source(i,j) - Ext_mode%eta_smooth(i,j))
         if (use_blobs) then
-           steady_forcing(i,j) = steady_forcing(i,j) + Grd%tmask(i,j,1)*Ext_mode%conv_blob(i,j)
+            steady_forcing(i,j) = steady_forcing(i,j) +Grd%tmask(i,j,1)*(Ext_mode%conv_blob(i,j))
         endif
      enddo
   enddo
@@ -3986,7 +3986,7 @@ end subroutine pred_corr_tropic_depth_cgrid
 !
 ! </DESCRIPTION>
 !
-subroutine pred_corr_tropic_press_bgrid (Time, Thickness, Ext_mode, pme, river, use_blobs)
+subroutine pred_corr_tropic_press_bgrid (Time, Thickness, Ext_mode, pme,river,use_blobs)
 
   type(ocean_time_type),          intent(in)    :: Time 
   type(ocean_thickness_type),     intent(in)    :: Thickness 
@@ -4068,8 +4068,8 @@ subroutine pred_corr_tropic_press_bgrid (Time, Thickness, Ext_mode, pme, river, 
         *(grav*(pme(i,j) + river(i,j) + Ext_mode%source(i,j) - Ext_mode%pbot_smooth(i,j)) &
         + Ext_mode%dpatm_dt(i,j))
         if (use_blobs) then
-           steady_forcing(i,j) = steady_forcing(i,j) + Grd%tmask(i,j,1)*Ext_mode%conv_blob(i,j)
-        endif 
+            steady_forcing(i,j) = steady_forcing(i,j) + Grd%tmask(i,j,1)*(Ext_mode%conv_blob(i,j))
+        endif  
      enddo
   enddo
 
@@ -4352,7 +4352,7 @@ end subroutine pred_corr_tropic_press_bgrid
 !
 ! </DESCRIPTION>
 !
-subroutine pred_corr_tropic_press_cgrid (Time, Thickness, Ext_mode, pme, river, use_blobs)
+subroutine pred_corr_tropic_press_cgrid (Time, Thickness, Ext_mode, pme,river,use_blobs)
 
   type(ocean_time_type),          intent(in)    :: Time 
   type(ocean_thickness_type),     intent(in)    :: Thickness 
@@ -4450,7 +4450,7 @@ subroutine pred_corr_tropic_press_cgrid (Time, Thickness, Ext_mode, pme, river, 
         *(grav*(pme(i,j) + river(i,j) + Ext_mode%source(i,j) - Ext_mode%pbot_smooth(i,j)) &
         + Ext_mode%dpatm_dt(i,j))
         if (use_blobs) then
-           steady_forcing(i,j) = steady_forcing(i,j) + Grd%tmask(i,j,1)*Ext_mode%conv_blob(i,j)
+            steady_forcing(i,j) = steady_forcing(i,j) +Grd%tmask(i,j,1)*(Ext_mode%conv_blob(i,j))
         endif 
      enddo
   enddo

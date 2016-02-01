@@ -1,6 +1,6 @@
 module ocean_blob_dynamic_bottom_mod
 !
-!<CONTACT EMAIL="m.bates@student.unsw.edu.au"> Michael L. Bates
+!<CONTACT EMAIL="m.bates@griffith.edu.au"> Michael L. Bates
 !</CONTACT>
 !
 !<CONTACT EMAIL="GFDL.Climate.Model.Info@noaa.gov"> Stephen M. Griffies
@@ -59,6 +59,14 @@ module ocean_blob_dynamic_bottom_mod
 !  <DATA NAME="use_this_module" TYPE="logical">
 !  Must be true to use this module.
 !  Default is use_this_module=.false.
+!  </DATA>
+!
+!  <DATA NAME="initial_position" TYPE="character">
+!  Where to initially place a new blob. Options are:
+!  initial_position="neighbour", which places it in
+!  a neighbouring cell, or
+!  initial_position="centre", which places it at the
+!  centre of the origin cell
 !  </DATA>
 !
 !  <DATA NAME="blob_overflow_mu" TYPE="real">
@@ -162,6 +170,26 @@ module ocean_blob_dynamic_bottom_mod
 !  Default is critical_richardson=0.8
 !  </DATA>
 !
+!  <DATA NAME="limit_init_blob_thick" TYPE="logical">
+!  Limit the maximum initial mass of a blob so as not to
+!  cause large ssh changes. The maximum initial blob mass
+!  is controled by max_init_blob_thick which is the equivalent
+!  grid cell thickness of the blob being formed. 
+!  Default is limit_init_blob_thick=.false.
+!  </DATA>
+!
+!  <DATA NAME="max_init_blob_thick" TYPE="real">
+!  The maximum initial thickness of a blob (units of metres).
+!  Default is max_init_blob_thick=0.01
+!  </DATA>
+!
+!
+!  <DATA NAME="return_flow" TYPE="real">
+!  Induce a return flow in the Eulerian model to remove
+!  any ssh varitions produced by the blobs.
+!  Default is return_flow=.false.
+!  </DATA>
+
 !</NAMELIST>
 !
 
@@ -178,7 +206,7 @@ use mpp_domains_mod, only: mpp_update_domains
 use ocean_blob_util_mod,  only: insert_blob, unlink_blob, blob_delete, interp_tcoeff, interp_ucoeff
 use ocean_blob_util_mod,  only: check_ijcell, free_blob_memory, kill_blob, count_blob, write_blobs
 use ocean_blob_util_mod,  only: allocate_interaction_memory, reallocate_interaction_memory
-use ocean_blob_util_mod,  only: E_and_L_totals, check_cyclic
+use ocean_blob_util_mod,  only: E_and_L_totals, check_cyclic, hashfun, hashfun_r
 use ocean_density_mod,    only: density
 use ocean_parameters_mod, only: onehalf, onethird, twothirds, rho0, rho0r, grav, omega_earth
 use ocean_parameters_mod, only: PRESSURE_BASED, DEPTH_BASED
@@ -199,9 +227,11 @@ type(ocean_domain_type), pointer :: Bdom  => NULL()
 type(blob_grid_type),    pointer :: Info  => NULL()
 
 real :: dtime
+real :: dtime_r
 real :: dtime_yr
 real :: det_factor
 real :: ent_factor
+real :: max_prop_thickness
 
 real, parameter :: sixonpi   = 6.0/pi
 real :: two_omega
@@ -261,6 +291,8 @@ integer, dimension(:,:), allocatable :: kmu
 integer, dimension(5) :: it, jt
 integer, dimension(4) :: iu, ju 
 
+logical :: centre
+
 type, private :: blob_buffer_type
    integer :: numblobs
    integer :: size
@@ -303,6 +335,7 @@ logical :: bitwise_reproduction
 
 ! namelist defaults
 logical :: use_this_module   = .false.
+character(len=10) :: initial_position = 'neighbour'
 character(len=10) :: update_method = 'BS_RK3(2)'
 real    :: blob_overflow_mu    = 1.0e-4  ! frictional dissipation rate (sec^-1) at bottom  
 real    :: blob_overflow_delta = 0.3333  ! fraction of a grid cell participating in overflow 
@@ -324,13 +357,19 @@ real    :: critical_richardson = 0.8
 real    :: blob_height         = 100.0 !m
 real    :: blobs_south_of      = -45.0
 real    :: blobs_north_of      =  45.0
+real    :: coeff1_weight       = 1.5
+real    :: coeff2_weight       = 0.5
+logical :: limit_init_blob_thick = .false.
+real    :: max_init_blob_thick = 0.01
+logical :: return_flow         = .false.
 
 namelist /ocean_blob_dynamic_bottom_nml/ use_this_module, update_method,   &
      blob_overflow_mu, blob_overflow_delta, drag, enforce_big_blobs,       &
      det_param, max_detrainment, rel_error, safety_factor, elastic,        &
      minstep, first_step, min_do_levels, rho_threshold, accept_free_blobs, &
      large_speed, no_rotation, critical_richardson, blob_height,           &
-     blobs_south_of, blobs_north_of
+     blobs_south_of, blobs_north_of, initial_position, coeff1_weight,      &
+     coeff2_weight, limit_init_blob_thick, max_init_blob_thick, return_flow
      
 contains
 !#######################################################################
@@ -349,7 +388,7 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
                                     debug, big_debug, bitwise, num_tracers,            &
                                     itemp, isalt, dtimein, ver_coord_class, ver_coord, &
                                     blob_diagnostics, bott_minstep, bott_total_ns,     &
-                                     smallmass, use_dyn_bot)
+                                     smallmass, use_dyn_bot,maxPropThickness)
 
   type(ocean_time_type),        intent(in)         :: Time
   type(ocean_grid_type),        intent(in), target :: Grid
@@ -370,6 +409,7 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
   integer, intent(out) :: bott_total_ns
   real,    intent(in)  :: smallmass
   logical, intent(out) :: use_dyn_bot
+  real,    intent(in)  :: maxPropThickness
 
   real, dimension(:,:), allocatable :: slope_x
   real, dimension(:,:), allocatable :: slope_y
@@ -424,6 +464,35 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
   blob_diag            = blob_diagnostics
   really_debug         = big_debug
 
+  max_prop_thickness=maxPropThickness
+
+  if (trim(initial_position)=='centre') then
+     centre=.true.
+  elseif (trim(initial_position)=='neighbour') then
+     centre=.false.
+  else
+     write(stdoutunit,'(a)')&
+          '==>Error in ocean_blob_dynamic_bottom_mod (ocean_blob_dynamic_bottom_init):' &
+          //' invalid value for namelist variable initial_position. Should either be'&
+          //' centre or neighbour'
+     write(stdoutunit,'(a,a)') 'initial_posiiton =',initial_position
+     call mpp_error(FATAL,&
+          '==>Error in ocean_blob_dynamic_bottom_mod (ocean_blob_dynamic_bottom_init):' &
+          //' invalid value for namelist variable initial_position. Should either be'&
+          //' centre or neighbour')
+  endif
+  if (centre) then
+     if (coeff1_weight+coeff2_weight.ne.2.0) then
+     write(stdoutunit,'(a)')&
+          '==>Error in ocean_blob_dynamic_bottom_mod (ocean_blob_dynamic_bottom_init):' &
+          //' sum of namelist parameters coeff1_weight and coeff2_weight must be equal to 2.0'
+     write(stdoutunit,'(a,a)') 'initial_posiiton =',initial_position
+     call mpp_error(FATAL,&
+          '==>Error in ocean_blob_dynamic_bottom_mod (ocean_blob_dynamic_bottom_init):' &
+          //' sum of namelist parameters coeff1_weight and coeff2_weight must be equal to 2.0')
+  endif
+endif
+
   id_free_to_bot = register_diag_field('ocean_model','free_to_bot', Time%model_time, &
        'free blobs interacting with topography', 'number of blobs')
 
@@ -434,6 +503,7 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
 
   dtime_rad_to_deg = dtime*rad_to_deg
   dtime_yr         = dtime*secs_in_year_r
+  dtime_r          = 1./dtime
 
   vert_coordinate_class = ver_coord_class
   vert_coordinate       = ver_coord
@@ -531,6 +601,10 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
   m=1
   coeff1(:,:) = Grd%dtw(isc+1:iec+1,jsc:jec)/Grd%dxte(isc:iec,jsc:jec)
   coeff2(:,:) = Grd%dte(isc  :iec  ,jsc:jec)/Grd%dxte(isc:iec,jsc:jec)
+  if (centre) then
+     coeff1(:,:)=coeff1_weight*coeff1(:,:)
+     coeff2(:,:)=coeff2_weight*coeff2(:,:)
+  endif
 
   hb(:,:,m) = Grd%ht(isc:iec,jsc:jec)*coeff1(:,:) + Grd%ht(isc+1:iec+1,jsc:jec)*coeff2(:,:)
   xb(:,:,m) = Grd%xt(isc:iec,jsc:jec)*coeff1(:,:) + Grd%xt(isc+1:iec+1,jsc:jec)*coeff2(:,:) 
@@ -541,6 +615,10 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
   m=2
   coeff1(:,:) = Grd%dts(isc:iec,jsc+1:jec+1)/Grd%dytn(isc:iec,jsc:jec)
   coeff2(:,:) = Grd%dtn(isc:iec,jsc  :jec  )/Grd%dytn(isc:iec,jsc:jec)
+  if (centre) then
+     coeff1(:,:)=coeff1_weight*coeff1(:,:)
+     coeff2(:,:)=coeff2_weight*coeff2(:,:)
+  endif
 
   hb(:,:,m) = Grd%ht(isc:iec,jsc:jec)*coeff1(:,:) + Grd%ht(isc:iec,jsc+1:jec+1)*coeff2(:,:) 
   xb(:,:,m) = Grd%xt(isc:iec,jsc:jec)*coeff1(:,:) + Grd%xt(isc:iec,jsc+1:jec+1)*coeff2(:,:) 
@@ -551,6 +629,10 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
   m=3
   coeff1(:,:) = Grd%dte(isc-1:iec-1,jsc:jec)/Grd%dxte(isc-1:iec-1,jsc:jec)
   coeff2(:,:) = Grd%dtw(isc  :iec,  jsc:jec)/Grd%dxte(isc-1:iec-1,jsc:jec)
+  if (centre) then
+     coeff1(:,:)=coeff1_weight*coeff1(:,:)
+     coeff2(:,:)=coeff2_weight*coeff2(:,:)
+  endif
 
   hb(:,:,m) = Grd%ht(isc:iec,jsc:jec)*coeff1(:,:) + Grd%ht(isc-1:iec-1,jsc:jec)*coeff2(:,:) 
   xb(:,:,m) = Grd%xt(isc:iec,jsc:jec)*coeff1(:,:) + Grd%xt(isc-1:iec-1,jsc:jec)*coeff2(:,:) 
@@ -561,6 +643,10 @@ subroutine blob_dynamic_bottom_init(Time, Grid, Domain, Blob_domain, PE_Info,   
   m=4
   coeff1(:,:) = Grd%dtn(isc:iec,jsc-1:jec-1)/Grd%dytn(isc:iec,jsc-1:jec-1)
   coeff2(:,:) = Grd%dts(isc:iec,jsc  :jec  )/Grd%dytn(isc:iec,jsc-1:jec-1)
+  if (centre) then
+     coeff1(:,:)=coeff1_weight*coeff1(:,:)
+     coeff2(:,:)=coeff2_weight*coeff2(:,:)
+  endif
 
   hb(:,:,m) = Grd%ht(isc:iec,jsc:jec)*coeff1(:,:) + Grd%ht(isc:iec,jsc-1:jec-1)*coeff2(:,:)
   xb(:,:,m) = Grd%xt(isc:iec,jsc:jec)*coeff1(:,:) + Grd%xt(isc:iec,jsc-1:jec-1)*coeff2(:,:)
@@ -1278,7 +1364,7 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
   type(ocean_blob_type), pointer :: prev => NULL()
   type(ocean_blob_type), pointer :: next => NULL()
   real,    dimension(1:6,0:ns) :: V
-  integer, dimension(3) :: old_ijk
+  integer, dimension(3) :: old_ijk, prev_cell
   logical, dimension(2) :: off
   real,    dimension(6) :: Xn, update, Xnp1, Xnp1_hat
   real,    dimension(3) :: old_lld, vel
@@ -1291,6 +1377,7 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
   integer :: total_blobs, leaving_pe, tfer_free, detrn_zero, move_lateral, ngrounded
   integer :: i, j, k, m, mm, n, r, s, ii
   integer :: iiu,jju,iit,jjt,ku
+  integer :: iio,jjo,kko
   integer :: n_frac_steps, tau
   integer :: stdoutunit
   logical :: change_pe, reached_end, advance_blob, accept_step, grounded
@@ -1357,6 +1444,7 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
         j        = this%j - Dom%joff
         k        = this%k
         old_ijk  = (/ i, j, k/)
+        prev_cell = (/ i, j, k/)
         lon      = this%lon
         lat      = this%lat
         geodepth = this%geodepth
@@ -1434,9 +1522,24 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
            uE = uE*ubigd
            vE = vE*ubigd
 
-           ! Put rhoE to the model density (rather than interpolate) so 
-           ! free blobs are not prematurely created.
-           rhoE = model_rho(i,j,k)
+           ! T-grid variables
+           tbigd = 0.0
+           rhoE = 0.0
+           do mm=1,Info%tidx(0,i,j)
+              iit=i+Info%it(Info%tidx(mm,i,j))
+              jjt=j+Info%jt(Info%tidx(mm,i,j))
+              ! We do not want to consider land points for ocean only variables (such as density).
+              ! However, by not including them sum(tcoeffs(ocean_points))<1.0 if there is
+              ! a land point included.  Such an approach will give a spuriously
+              ! low value for the variable.  We thus accumulate tcoeffs and divide to make
+              ! sure the value is not spuriously low.
+              if(kmt(iit,jjt)>0) then
+                 tbigd = tbigd + tdsq_r(mm)
+                 rhoE = rhoE + model_rho(iit,jjt,kmt(iit,jjt))*tdsq_r(mm)
+              endif
+           enddo
+           tbigd = 1.0/tbigd
+           rhoE = rhoE*tbigd
 
            ! speed of the blob
            absv2  = vel(1)**2 + vel(2)**2 + vel(3)**2
@@ -1524,7 +1627,7 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
 
               ! Estimate the error using the difference in the high and low order schemes.
               ii    = maxloc(abs((Xnp1(:) - Xnp1_hat(:))/(Xnp1(:)+epsln)),1)
-              trunc = abs(Xnp1(ii) - Xnp1_hat(ii) + epsln)
+              trunc = abs(Xnp1(ii) - Xnp1_hat(ii)) + epsln
               tstar = rel_error*abs(Xnp1(ii))
               hstar = tstep * (safety_factor*tstar/trunc)**(orderp1_r)
 
@@ -1607,7 +1710,12 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
                     ent = 0.
                  endif
                  
-                 det = -det_factor/abs(rhoL - rhoE + epsln)
+                 if (centre .and. this%hash==hashfun(i,j,k)) then
+                    !Avoid detrainment if we are still in the grid cell of origin
+                    det=0
+                 else
+                    det = -det_factor/abs(rhoL - rhoE + epsln)
+                 endif
                  
                  if (vert_coordinate_class==DEPTH_BASED) then
                     !det_factor = Gamma * (rho0*36pi)**1/3
@@ -1878,23 +1986,22 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
                     endif
 
                     volume = mass*rhor
-                    ! Update rhoE before the free blob check
-                    ! to account for blobs that moved to shallower water
-                    rhoE = model_rho(i,j,k)
-
                     ! Check whether a blob that is not small has separated
                     if (rhoL < rhoE) then
                        ! If so, save values to the blob, unlink it and send it to an
                        ! intermediate linked list, before turning it into a free blob.
-                       
+                       !print *, 'stuff', 'rhoL', rhoL, 'model_rho',model_rho(this%i,this%j,this%k), 'Dens%rho', Dens%rho(this%i,this%j,this%k,tau)
+                       !print *, 'model_rho-rhoL', model_rho(i,j,k)-rhoL
+
                        ! Update a counter
                        if (this%i /= i .or. this%j /= j) move_lateral = move_lateral + 1
-                       
+
                        this%blob_time = dtime
                        this%step      = max(tstep, minstep)
 
                        this%i         = i+Dom%ioff
                        this%j         = j+Dom%joff
+                       !print *, 'model_rho-rhoL',model_rho(this%i,this%j,this%k)-rhoL
                        this%k         = k
                        this%geodepth  = geodepth
                        this%lon       = lon
@@ -1954,7 +2061,9 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
               reached_end = .true.
 
               ! update a counter
-              if (this%i /= i .or. this%j /= j) move_lateral = move_lateral + 1
+              if (this%i /= i .or. this%j /= j) then
+                 move_lateral = move_lateral + 1
+              endif
 
               ! Update the blob variables
               this%step = max(tstep,minstep)
@@ -2148,6 +2257,7 @@ subroutine dynamic_update(head, free, Time, Dens, Thickness,    &
         else
            this=>next
         endif
+
         if (.not. associated(this)) exit blobcycle
         
      enddo blobcycle
@@ -2357,16 +2467,23 @@ subroutine dynamic_bottom_form_new(Time, Dens, T_prog, Thickness, Ext_mode, &
   
   type(ocean_blob_type), pointer :: this, prev, next, new_head
   real, dimension(4) :: udsq_r
+  real, dimension(isd:ied,jsd:jed,1:nk) :: source_mass
+  real, dimension(isd:ied,jsd:jed,1:nk,num_prog_tracers) :: source_tracer
   real :: ubigd
-  integer :: tau, i, iip, iiu, j, jjp, jju, k, m, mm, n, nblobs
+  integer :: tau, i, iip, iiu, iio, j, jjp, jju, jjo, k, kko, m, mm, n, nblobs,hash
+  integer, dimension(3) :: origin_cell
   integer :: stdoutunit
   real :: overflow_flux, overflow_speed
+  real :: flux_mass, flux_tracer
   real :: blob_mass, do_dens, so_dens, drho, drho_rhor
+  real :: blob_thick, new_thick
   real :: uE, vE
 
   if (.not. use_this_module) return
 
-  nblobs = 0
+  nblobs = 0 
+  source_mass(:,:,:) = 0.0
+  source_tracer(:,:,:,:) = 0.0
 
   tau   = Time%tau
 
@@ -2447,8 +2564,23 @@ subroutine dynamic_bottom_form_new(Time, Dens, T_prog, Thickness, Ext_mode, &
                     if (0.25*Thickness%rho_dzt(i,j,k,tau)*Grd%dat(i,j) < blob_mass) then 
                        blob_mass = 0.25*Thickness%rho_dzt(i,j,k,tau)*Grd%dat(i,j) 
                     endif
-                 endif
 
+                    !limit blob thickness to reduce ssh anomalies?
+                    if (limit_init_blob_thick) then
+                        blob_thick=Grd%datr(iip,jjp)*rho0r*blob_mass
+                        if (blob_thick>max_init_blob_thick) then
+                            blob_mass = max_init_blob_thick*Grd%dat(iip,jjp)*rho0
+                        endif
+                    endif
+
+                    if (centre) then
+                       ! Avoid forming a new blob if it will violate the mass condition
+                       blob_thick=Grd%datr(i,j)*rho0r*blob_mass !only approximate for pressure coordinates
+                       new_thick = Thickness%dztloL(i,j,k)+blob_thick
+                       if (new_thick>max_prop_thickness*Thickness%dztloT(i,j,k)) cycle
+                    endif 
+                       
+                 endif
 
                  ! Form the onshelf blobs.  Make sure they are in the 
                  ! compute domain.
@@ -2467,11 +2599,16 @@ subroutine dynamic_bottom_form_new(Time, Dens, T_prog, Thickness, Ext_mode, &
                                         Dens%pressure_at_depth(iip,jjp,k))
                  this%densityr = 1.0/this%density
 
-                 ! Calculate the divergence (convergence comes later)
-                 Ext_mode%conv_blob(i,j)   = Ext_mode%conv_blob(i,j)   - this%mass
-                 L_system%conv_blob(i,j,k) = L_system%conv_blob(i,j,k) - this%mass
-                 mass_out(i,j,k)           = mass_out(i,j,k)           + this%mass
-                 
+                 if (.not. centre) then
+                    ! Calculate the divergence (convergence comes later)
+                    Ext_mode%conv_blob(i,j)   = Ext_mode%conv_blob(i,j)   - this%mass
+                    L_system%conv_blob(i,j,k) = L_system%conv_blob(i,j,k) - this%mass
+                    mass_out(i,j,k)           = mass_out(i,j,k)           + this%mass
+                    !if (return_flow) then
+                    !   call induce_return(i,j,k,blob_mass,T_prog,Thickness,Time,Ext_mode)
+                    !endif
+                 endif
+
                  this%height = blob_height
 
                  if (vert_coordinate_class == DEPTH_BASED) then
@@ -2501,43 +2638,69 @@ subroutine dynamic_bottom_form_new(Time, Dens, T_prog, Thickness, Ext_mode, &
                     EL_diag(n)%new(i,j,k) = EL_diag(n)%new(i,j,k) + this%tracer(n)
                  enddo
 
-                 this%i = iip
-                 this%j = jjp
-                 
                  ! Find the initial position and stretching function
-                 ! We will adjust the initial position after the initial velocity
-                 ! has been calculated
+                 ! If centre=.false., we will adjust the initial position 
+                 ! after the initial velocity has been calculated
                  this%h1  = blobh1(i,j,m)
                  this%h2  = blobh2(i,j,m)
                  this%lon = xb(i,j,m)
                  this%lat = yb(i,j,m)
-
-                 this%blob_time = 0.0
-                 
                  this%geodepth = hb(i,j,m)
-                 this%depth    = this%geodepth + Ext_mode%eta_t(i,j,tau)
-                 if (vert_coordinate_class==DEPTH_BASED) then
-                    this%st = -Thickness%depth_swt(i,j,k)
-                 else !PRESSURE_BASED
-                    this%st = Thickness%depth_swt(i,j,k)
-                 endif
 
-                 call interp_ucoeff(i,j,(/this%h1,this%h2/),this%lon,this%lat,udsq_r(:))        
-                 ! Interpolate the E system variables to the blobs
-                 ! Note, we treat the stretching function separately
                  ubigd = 0.0
                  uE=0.0; vE=0.0
-                 do mm=1,Info%uidx(0,i,j)
-                    iiu=i+Info%iu(Info%uidx(mm,i,j))
-                    jju=j+Info%ju(Info%uidx(mm,i,j))
-                    ! Land points are treated as a zero
-                    if(kmu(iiu,jju)>0) then
-                       uE = uE + u(iiu,jju,kmu(iiu,jju),1)*udsq_r(mm)
-                       vE = vE + u(iiu,jju,kmu(iiu,jju),2)*udsq_r(mm)
+
+                 if (centre) then
+                    this%depth    = this%geodepth + Ext_mode%eta_t(i,j,tau)
+                    if (vert_coordinate_class==DEPTH_BASED) then
+                       this%st = -Thickness%depth_swt(i,j,k)
+                    else !PRESSURE_BASED
+                       this%st = Thickness%depth_swt(i,j,k)
                     endif
-                    ubigd = ubigd + udsq_r(mm)
-                 enddo
-                 ubigd = 1.0/ubigd
+                    call interp_ucoeff(i,j,(/this%h1,this%h2/),this%lon,this%lat,udsq_r(:))        
+                    this%depth    = this%geodepth + Ext_mode%eta_t(i,j,tau)
+
+                    ! Interpolate the E system variables to the blobs
+                    ! Note, we treat the stretching function separately
+                    do mm=1,Info%uidx(0,i,j)
+                       iiu=i+Info%iu(Info%uidx(mm,i,j))
+                       jju=j+Info%ju(Info%uidx(mm,i,j))
+                       ! Land points are treated as a zero
+                       if(kmu(iiu,jju)>0) then
+                          uE = uE + u(iiu,jju,kmu(iiu,jju),1)*udsq_r(mm)
+                          vE = vE + u(iiu,jju,kmu(iiu,jju),2)*udsq_r(mm)
+                       endif
+                       ubigd = ubigd + udsq_r(mm)
+                    enddo
+                    ubigd = 1.0/ubigd
+                 else
+                    this%i = iip
+                    this%j = jjp
+                 
+                    this%depth    = this%geodepth + Ext_mode%eta_t(iip,jjp,tau)
+                    if (vert_coordinate_class==DEPTH_BASED) then
+                       this%st = -Thickness%depth_swt(iip,jjp,kmt(iip,jjp))
+                    else !PRESSURE_BASED
+                       this%st = Thickness%depth_swt(iip,jjp,kmt(iip,jjp))
+                    endif
+                    call interp_ucoeff(iip,jjp,(/this%h1,this%h2/),this%lon,this%lat,udsq_r(:))        
+                    this%depth    = this%geodepth + Ext_mode%eta_t(iip,jjp,tau)
+
+                    ! Interpolate the E system variables to the blobs
+                    ! Note, we treat the stretching function separately
+                    do mm=1,Info%uidx(0,iip,jjp)
+                       iiu=i+Info%iu(Info%uidx(mm,iip,jjp))
+                       jju=j+Info%ju(Info%uidx(mm,iip,jjp))
+                       ! Land points are treated as a zero
+                       if(kmu(iiu,jju)>0) then
+                          uE = uE + u(iiu,jju,kmu(iiu,jju),1)*udsq_r(mm)
+                          vE = vE + u(iiu,jju,kmu(iiu,jju),2)*udsq_r(mm)
+                       endif
+                       ubigd = ubigd + udsq_r(mm)
+                    enddo
+                    ubigd = 1.0/ubigd
+                 endif
+                 this%blob_time = 0.0
                  
                  uE = uE*ubigd
                  vE = vE*ubigd
@@ -2558,33 +2721,35 @@ subroutine dynamic_bottom_form_new(Time, Dens, T_prog, Thickness, Ext_mode, &
                  endif
                  this%v(3) = vert_factor(i,j,m)*drho_rhor
 
-                 ! Adjust the initial position (this guarantees we are in
-                 ! the correct cell, and not exactly on the edge of two cells)
-                 this%lon = this%lon + this%v(1)*dtime_rad_to_deg/this%h1
-                 this%lat = this%lat + this%v(2)*dtime_rad_to_deg/this%h2
-
                  this%new  = .false.
                  this%step = first_step
                  
-                 ! test if this has gone out to the E,W,N or S of the 
-                 ! compute domain.  If it has, then pack it into an outward
-                 ! buffer and remove it from this PE's list of blobs
-                 if (iip>iec) then
-                    call packbuffer(this, Ebuffer_out)
-                    call unlink_blob(this, new_head, prev, next)
-                    call free_blob_memory(this)
-                 elseif (iip<isc) then
-                    call packbuffer(this, Wbuffer_out)
-                    call unlink_blob(this, new_head, prev, next)
-                    call free_blob_memory(this)
-                 elseif (jjp>jec) then
-                    call packbuffer(this, Nbuffer_out)
-                    call unlink_blob(this, new_head, prev, next)
-                    call free_blob_memory(this)
-                 elseif (jjp<jsc) then
-                    call packbuffer(this, Sbuffer_out)
-                    call unlink_blob(this, new_head, prev, next)
-                    call free_blob_memory(this)
+                 if (.not. centre) then
+                    ! Adjust the initial position (this guarantees we are in
+                    ! the correct cell, and not exactly on the edge of two cells)
+                    this%lon = this%lon + this%v(1)*dtime_rad_to_deg/this%h1
+                    this%lat = this%lat + this%v(2)*dtime_rad_to_deg/this%h2
+
+                    ! test if this has gone out to the E,W,N or S of the 
+                    ! compute domain.  If it has, then pack it into an outward
+                    ! buffer and remove it from this PE's list of blobs
+                    if (iip>iec) then
+                       call packbuffer(this, Ebuffer_out)
+                       call unlink_blob(this, new_head, prev, next)
+                       call free_blob_memory(this)
+                    elseif (iip<isc) then
+                       call packbuffer(this, Wbuffer_out)
+                       call unlink_blob(this, new_head, prev, next)
+                       call free_blob_memory(this)
+                    elseif (jjp>jec) then
+                       call packbuffer(this, Nbuffer_out)
+                       call unlink_blob(this, new_head, prev, next)
+                       call free_blob_memory(this)
+                    elseif (jjp<jsc) then
+                       call packbuffer(this, Sbuffer_out)
+                       call unlink_blob(this, new_head, prev, next)
+                       call free_blob_memory(this)
+                    endif
                  endif
               endif !rho_so>rho_do?
            endif !topog_step==1.0?
@@ -2592,65 +2757,85 @@ subroutine dynamic_bottom_form_new(Time, Dens, T_prog, Thickness, Ext_mode, &
      enddo !j
   enddo !m
   
-  ! Now, send blobs to neighbouring PE's.  Note: since blobs can only move
-  ! N,S,E or W, we do not need to worry about diagonal PE's 
-  ! (i.e. NE,SE,SW,NW)
-  call send_buffer(Ebuffer_out)
-  call send_buffer(Wbuffer_out)
-  call send_buffer(Nbuffer_out)
-  call send_buffer(Sbuffer_out)
+  if (centre) then
+     if(associated(new_head)) then
+        this=>new_head
+        newcycle: do
+           call unlink_blob(this, new_head, prev, next)
+           call insert_blob(this, head)
+           this=>next
+           if(.not.associated(this)) exit newcycle
+        enddo newcycle
+     endif
+
+   else
+     ! Now, send blobs to neighbouring PE's.  Note: since blobs can only move
+     ! N,S,E or W, we do not need to worry about diagonal PE's 
+     ! (i.e. NE,SE,SW,NW)
+     call send_buffer(Ebuffer_out)
+     call send_buffer(Wbuffer_out)
+     call send_buffer(Nbuffer_out)
+     call send_buffer(Sbuffer_out)
   
-  call mpp_sync_self()
+     call mpp_sync_self()
+     
+     ! Clear the incoming buffers
+      call clear_buffer(Wbuffer_in)
+      call clear_buffer(Ebuffer_in)
+      call clear_buffer(Sbuffer_in)
+      call clear_buffer(Nbuffer_in)
+      
+      ! Now receive blobs from neighbouring PE's
+      call receive_buffer(Wbuffer_in)
+      call receive_buffer(Ebuffer_in)
+      call receive_buffer(Sbuffer_in)
+      call receive_buffer(Nbuffer_in)
 
-  ! Clear the incoming buffers
-  call clear_buffer(Wbuffer_in)
-  call clear_buffer(Ebuffer_in)
-  call clear_buffer(Sbuffer_in)
-  call clear_buffer(Nbuffer_in)
-  
-  ! Now receive blobs from neighbouring PE's
-  call receive_buffer(Wbuffer_in)
-  call receive_buffer(Ebuffer_in)
-  call receive_buffer(Sbuffer_in)
-  call receive_buffer(Nbuffer_in)
-  
-  ! Now unpack the buffer and add the received blobs to this PE's blob list
-  call unpackbuffer(Time, Wbuffer_in, new_head, Dens, Ext_mode, Thickness)
-  call unpackbuffer(Time, Ebuffer_in, new_head, Dens, Ext_mode, Thickness)
-  call unpackbuffer(Time, Sbuffer_in, new_head, Dens, Ext_mode, Thickness)
-  call unpackbuffer(Time, Nbuffer_in, new_head, Dens, Ext_mode, Thickness)
+      ! Now unpack the buffer and add the received blobs to this PE's blob list
+      call unpackbuffer(Time, Wbuffer_in, new_head, Dens, Ext_mode, Thickness)
+      call unpackbuffer(Time, Ebuffer_in, new_head, Dens, Ext_mode, Thickness)
+      call unpackbuffer(Time, Sbuffer_in, new_head, Dens, Ext_mode, Thickness)
+      call unpackbuffer(Time, Nbuffer_in, new_head, Dens, Ext_mode, Thickness)
 
-  if(associated(new_head)) then
-     this=>new_head
-     blobcycle: do
-        i = this%i
-        j = this%j
-        k = this%k
+      if(associated(new_head)) then
+         this=>new_head
+         blobcycle: do
+            i = this%i
+            j = this%j
+            k = this%k
 
-        ! Calculate the convergence
-        Ext_mode%conv_blob(i,j)   = Ext_mode%conv_blob(i,j)   + this%mass
-        L_system%conv_blob(i,j,k) = L_system%conv_blob(i,j,k) + this%mass
-        mass_in(i,j,k)            = mass_in(i,j,k)            + this%mass
+            ! Calculate the convergence
+            Ext_mode%conv_blob(i,j)   = Ext_mode%conv_blob(i,j)   + this%mass
+            L_system%conv_blob(i,j,k) = L_system%conv_blob(i,j,k) + this%mass
+            mass_in(i,j,k)            = mass_in(i,j,k)            + this%mass
 
-        call unlink_blob(this, new_head, prev, next)
-        call insert_blob(this, head)
-        
-        this=>next
-        if(.not.associated(this)) exit blobcycle
-     enddo blobcycle
-  endif
-  
-  call mpp_sum(nblobs)
-  if (id_new_blobs>0) used = send_data(id_new_blobs, real(nblobs), Time%model_time)
+            !if (return_flow) then
+            !   origin_cell = hashfun_r(this%hash)
+            !   kko = origin_cell(3)
+            !   call induce_return(i,j,kko,-1.*this%mass,T_prog,Thickness,Time,Ext_mode)
+            !endif ! return flow?
+   
+            call unlink_blob(this, new_head, prev, next)
+            call insert_blob(this, head)
 
-  if (debug_this_module) then
-     call write_timestamp(Time%model_time)
-     write(stdoutunit, '(a)') 'From ocean_blob_dynamics_bottom_mod'
-     write(stdoutunit, '(a)') 'Totals after bottom dynamic blob creation (tau)'
-     call E_and_L_totals(L_system,Thickness,T_prog(:),tau)
-     write(stdoutunit, '(a,i4)') 'New bottom dynamic blobs (taup1) = ', nblobs
-     write(stdoutunit, '(a)') ' '
-  endif
+            this=>next
+            if(.not.associated(this)) exit blobcycle
+         enddo blobcycle
+      endif
+
+      call mpp_sum(nblobs)
+      if (id_new_blobs>0) used = send_data(id_new_blobs, real(nblobs), Time%model_time)
+
+      if (debug_this_module) then
+         call write_timestamp(Time%model_time)
+         write(stdoutunit, '(a)') 'From ocean_blob_dynamics_bottom_mod'
+         write(stdoutunit, '(a)') 'Totals after bottom dynamic blob creation (tau)'
+         call E_and_L_totals(L_system,Thickness,T_prog(:),tau)
+         write(stdoutunit, '(a,i4)') 'New bottom dynamic blobs (taup1) = ', nblobs
+         write(stdoutunit, '(a)') ' '
+      endif
+   endif
+
 
 end subroutine dynamic_bottom_form_new
 ! </SUBROUTINE>  NAME="dynamic_bottom_form_new"
@@ -3017,7 +3202,6 @@ subroutine increase_buffer(buffer, newnum)
   type(blob_buffer_type), pointer :: new_buffer
   integer :: newbuffsize, m
 
-  newbuffsize = buffer%size
   allocate(new_buffer)
   m=1
   do while (newnum>newbuffsize)
@@ -3140,5 +3324,40 @@ subroutine clear_buffer(buffer)
   !note, we do not clear buffer%size
 end subroutine clear_buffer
 ! </SUBROUTINE>  NAME="clear_buffer"
+
+!#######################################################################
+! <SUBROUTINE NAME="induce_return">
+!
+! <DESCRIPTION>
+! Transfer tracer and mass between water columns upon blob formation/movement
+! </DESCRIPTION>
+!
+subroutine induce_return(i, j, k, mass, T_prog,Thickness,Time,Ext_mode)
+  type(ocean_prog_tracer_type), intent(inout) :: T_prog(:)
+  type(ocean_thickness_type),   intent(inout) :: Thickness
+  type(ocean_external_mode_type),   intent(inout) :: Ext_mode
+  type(ocean_time_type),        intent(in)    :: Time
+  integer,                      intent(in)    :: i, j, k
+  real,                         intent(in)    :: mass
+  integer                                     :: tau, taum1, taup1, n
+  real                                        :: flux_mass, flux_tracer
+
+  !print *, i, j, k
+  tau=Time%tau
+  taup1=Time%taup1
+  taum1=Time%taum1
+  ! mass source (kg/m^3)(m/s)
+  flux_mass = mass*dtime_r
+  Ext_mode%conv_blob(i,j)   = Ext_mode%conv_blob(i,j) + mass
+  !Thickness%mass_source(i,j,k)=Thickness%mass_source(i,j,k) + Grd%datr(i,j)*flux_mass
+
+  ! now do tracers
+  do n=1,num_prog_tracers
+     flux_tracer = flux_mass*T_prog(n)%field(i,j,k,taum1)
+     T_prog(n)%th_tendency(i,j,k)=T_prog(n)%th_tendency(i,j,k) + Grd%datr(i,j)*flux_tracer
+  enddo
+end subroutine induce_return
+
+! </SUBROUTINE>  NAME="induce_return"
 
 end module ocean_blob_dynamic_bottom_mod
