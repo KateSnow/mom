@@ -119,6 +119,7 @@ public check_kcell
 public kill_blob
 public free_blob_memory
 public hashfun
+public hashfun_r
 public unlink_blob
 public allocate_interaction_memory
 public reallocate_interaction_memory
@@ -527,12 +528,12 @@ subroutine blob_util_init(Grid, Domain, PE_info, Blob_domain, &
   allocate(Info%minlat(isc:iec))
 
   do j=jsc,jec
-     Info%minlon(j) = minval(vert_t(1,:,isc:iec,j))
-     Info%maxlon(j) = maxval(vert_t(1,:,isc:iec,j))
+     Info%minlon(j) = minval(vert_t(1,:,:,j))
+     Info%maxlon(j) = maxval(vert_t(1,:,:,j))
   enddo
   do i=isc,iec
-     Info%minlat(i) = minval(vert_t(2,:,i,jsc:jec))
-     Info%maxlat(i) = maxval(vert_t(2,:,i,jsc:jec))
+     Info%minlat(i) = minval(vert_t(2,:,i,:))
+     Info%maxlat(i) = maxval(vert_t(2,:,i,:))
   enddo
 
 end subroutine blob_util_init
@@ -1416,6 +1417,24 @@ integer function hashfun(i,j,k)
   hashfun = k + nk*j + Info%nk_nj*i
 end function hashfun
 ! </FUNCTION>  NAME="hashfun"
+
+!######################################################################
+! <FUNCTION NAME="hashfun_r">
+!
+! <DESCRIPTION>
+! Calculates the hash
+! </DESCRIPTION>
+!
+function hashfun_r(hash)
+  integer, intent(in) :: hash
+  integer             :: i,j,k
+  integer, dimension(3) :: hashfun_r
+  i = int(hash/(Info%nk_nj))
+  j = int(modulo(hash,Info%nk_nj)/nk)
+  k = hash - Info%nk_nj*i - nk*j 
+  hashfun_r = (/i,j,k/)
+end function
+! </FUNCTION>  NAME="hashfun_r"
 
 !######################################################################
 ! <SUBROUTINE NAME="blob_util_end">

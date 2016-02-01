@@ -420,11 +420,12 @@ subroutine blob_overflow_like(Time, Thickness, T_prog, Dens, head, blob_counter)
               overflow_speed = 0.0 !overflow speed m/s
 
               ! check whether density of shelf water is more than deep water
-              if(Dens%rho(i,j,kup,tau) > Dens%rho(iip,jjq,kup,tau)) then
+              !!!if(Dens%rho(i,j,kup,tau) > Dens%rho(iip,jjq,kup,tau)) then
+              if(Dens%rho(i,j,kup,tau) > Dens%rho(iip,jjq,Grd%kmt(iip,jjq),tau)) then
                  
                  ! calculate the overflow velocity
                  overflow_speed = overflow_factor*topog_slope(i,j,m) &
-                                  *( Dens%rho(i,j,kup,tau)-Dens%rho(iip,jjq,kup,tau) )
+                                  *( Dens%rho(i,j,kup,tau)-Dens%rho(iip,jjq,Grd%kmt(iip,jjq),tau) )
                  overflow_speed = min(overflow_speed, blob_overflow_umax)
 
                  ! find the neutral level, or the lowest ocean grid box
@@ -462,10 +463,10 @@ subroutine blob_overflow_like(Time, Thickness, T_prog, Dens, head, blob_counter)
                  ! using rho_dzt 
                  overflow_thickness = Thickness%rho_dzt(i,j,kup,tau)
     
-                 do k=kup,kdw
-                    overflow_thickness = min(overflow_thickness,&
-                                         Thickness%rho_dzt(iip,jjq,k,tau))
-                 enddo
+                 !do k=kup,kdw
+                 !   overflow_thickness = min(overflow_thickness,&
+                 !                        Thickness%rho_dzt(iip,jjq,k,tau))
+                 !enddo
 
                  ! overflow flux is (m^2/s).  In order to get mass (kg), we
                  ! need to multiply by overflow_thickness(kg/m^2)*dtime(s)
